@@ -61,6 +61,14 @@ class QtRule(qconfig.QuantizationRule):
   # guarantees.
   additional_qt_config: Mapping[str, Any] | None = None
 
+  # Block size for non-contraction axis tiling on weights. When set, weights
+  # use tiled quantization on non-contraction axes (e.g. 128 gives 128×128).
+  rhs_non_contraction_tile_size: int | float | None = None
+
+  # Dual residuals: save a second fp8 QArray in wgrad layout for drhs fast path.
+  use_dual_residuals: bool = False
+  drhs_wgrad_tile_size: int | float | None = None
+
 
 class QtProvider(qconfig.QuantizationProvider):
   """Quantization provider for Quantized Training (QT)."""
@@ -366,6 +374,7 @@ class QtProvider(qconfig.QuantizationProvider):
         lhs_qtype=lhs_qtype,
         rhs_qtype=rhs_qtype,
         tile_size=rule.tile_size,
+        rhs_non_contraction_tile_size=rule.rhs_non_contraction_tile_size,
         lhs_calibration_method=lhs_calibration_method,
         rhs_calibration_method=rhs_calibration_method,
         lhs_collect_quant_stat=lhs_collect_quant_stat,
@@ -384,6 +393,10 @@ class QtProvider(qconfig.QuantizationProvider):
         drhs_tile_size=drhs_tile_size,
         drhs_stochastic_rounding_noise_fn=bwd_stochastic_rounding_noise_fn,
         drhs_grad_disable_channelwise_axes=rule.disable_channelwise_axes,
+        # dual residuals.
+        use_dual_residuals=rule.use_dual_residuals,
+        drhs_wgrad_tile_size=rule.drhs_wgrad_tile_size,
+        drhs_wgrad_qtype=rule.weight_qtype,
     )
 
     if rule.additional_qt_config:

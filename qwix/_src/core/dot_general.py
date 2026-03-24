@@ -29,6 +29,7 @@ def get_how_to_quantize(
     ndims: tuple[int, int],
     for_lhs: bool,
     tile_size: int | float | None,
+    non_contraction_tile_size: int | float | None = None,
     **kwargs: Any,
 ) -> qarray.HowToQuantize:
   """Get how to quantize from dimension_numbers and remaining_dims.
@@ -41,6 +42,9 @@ def get_how_to_quantize(
     ndims: The number of dimensions for lhs and rhs.
     for_lhs: Whether to quantize lhs or rhs.
     tile_size: The tile size for subchannel quantization.
+    non_contraction_tile_size: The tile size for non-contraction axes. When set,
+      non-contraction axes use tiled quantization instead of channelwise.
+      E.g. 128 gives 128×128 blockwise quantization on weights.
     **kwargs: Additional keyword arguments to HowToQuantize.
 
   Returns:
@@ -53,10 +57,17 @@ def get_how_to_quantize(
     ndim = ndims[1]
     contracting_axes = dimension_numbers[0][1]
 
-  channelwise_axes = sorted(set(range(ndim)) - set(contracting_axes))
+  non_contracting = sorted(set(range(ndim)) - set(contracting_axes))
   tiled_axes = {}
   if tile_size:
-    tiled_axes = {contracting_axes[0]: tile_size}
+    tiled_axes[contracting_axes[0]] = tile_size
+
+  if non_contraction_tile_size:
+    channelwise_axes = []
+    for axis in non_contracting:
+      tiled_axes[axis] = non_contraction_tile_size
+  else:
+    channelwise_axes = non_contracting
 
   return qarray.HowToQuantize(
       channelwise_axes=channelwise_axes,

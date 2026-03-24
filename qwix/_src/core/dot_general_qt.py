@@ -34,6 +34,7 @@ class DotGeneralQtConfig:
   lhs_qtype: jax.typing.DTypeLike | None = None
   rhs_qtype: jax.typing.DTypeLike | None = None
   tile_size: int | float | None = None
+  rhs_non_contraction_tile_size: int | float | None = None
   lhs_calibration_method: str = 'absmax'
   rhs_calibration_method: str = 'absmax'
   lhs_collect_quant_stat: Callable[[Any], Any] | None = None
@@ -76,6 +77,13 @@ class DotGeneralQtConfig:
   drhs_residual_qtype: jax.typing.DTypeLike | None = None
   drhs_residual_calibration_method: str = 'absmax'
   drhs_residual_disable_channelwise_axes: bool = False
+
+  # Dual residuals: save a second fp8 QArray of the activation in wgrad layout
+  # during forward, so that the drhs backward can also use the fast path.
+  use_dual_residuals: bool = False
+  drhs_wgrad_tile_size: int | float | None = None
+  drhs_wgrad_qtype: jax.typing.DTypeLike | None = None
+  drhs_wgrad_calibration_method: str = 'absmax'
 
 
 def _ranges_like(*xs):
@@ -140,6 +148,51 @@ def _apply_rhs_scale_to_lhs(lhs, rhs_scale, dnums):
   return qarray.call_with_generic_broadcast(jnp.multiply, lhs, lhs_scale)
 
 
+def _build_wgrad_how_to_quantize(
+    array: jax.Array,
+    bwd_dnums: jax.lax.DotDimensionNumbers,
+    qtype: jax.typing.DTypeLike,
+    tile_size: int | float | None,
+    calibration_method: str,
+) -> qarray.HowToQuantize:
+  """Build HowToQuantize for wgrad layout, handling small dimensions.
+
+  In wgrad backward, the activation is the rhs of the dot. Its contraction
+  axes correspond to the batch+sequence dims of the original forward. Some of
+  these dims (e.g. batch=2) may be too small to tile at ``tile_size=128``.
+
+  For such axes we use ``tiled_axes={axis: 1.0}`` (float tile size = single
+  tile covering the whole dim), which yields ``scale.shape[axis] = 1``.  This
+  avoids triggering the slow-path check in ``dot_general.dot_general()``
+  (which fires when ``scale.shape[axis] > 1`` and tile_size < 128).
+
+  Non-contraction axes remain channelwise.
+  """
+  # activation is rhs in backward dot: contracting axes come from index [1]
+  contracting_axes = bwd_dnums[0][1]
+  non_contracting = sorted(set(range(array.ndim)) - set(contracting_axes))
+
+  channelwise_axes = list(non_contracting)
+  tiled_axes = {}
+  for axis in contracting_axes:
+    dim = array.shape[axis]
+    if isinstance(tile_size, float) or (
+        tile_size and dim >= tile_size and dim % tile_size == 0
+    ):
+      tiled_axes[axis] = tile_size
+    elif tile_size:
+      # Dim too small or not divisible — use float 1.0 so the whole dim
+      # becomes a single tile (scale=1), skipping slow-path check.
+      tiled_axes[axis] = 1.0
+
+  return qarray.HowToQuantize(
+      qtype=qtype,
+      channelwise_axes=channelwise_axes,
+      tiled_axes=tiled_axes,
+      calibration_method=calibration_method,
+  )
+
+
 # See test_scan_custom_vjp in interception_test.py for why we need to manually
 # disable interceptions for dot_general_qt_fwd.
 @interception.disable_interceptions
@@ -167,7 +220,24 @@ def dot_general_qt_fwd(
     rhs = qarray.quantize_with_scale_zero_point(
         rhs, config.rhs_qtype, scale, zero_point
     )
-  residuals = (lhs_in, rhs_in, lhs, rhs, lhs_calibration, rhs_calibration)
+
+  # Dual residuals: pre-quantize activation in wgrad layout for drhs fast path.
+  lhs_wgrad = None
+  if config.use_dual_residuals and config.lhs_qtype:
+    drhs_bwd_dnums, _ = _update_dimension_numbers_for_backward(
+        dimension_numbers, (lhs_in.ndim, rhs_in.ndim), for_dlhs=False
+    )
+    wgrad_qtype = config.drhs_wgrad_qtype or config.lhs_qtype
+    wgrad_tile = config.drhs_wgrad_tile_size or config.tile_size
+    lhs_wgrad_how = _build_wgrad_how_to_quantize(
+        lhs_in, drhs_bwd_dnums, wgrad_qtype, wgrad_tile,
+        config.drhs_wgrad_calibration_method,
+    )
+    lhs_wgrad = qarray.quantize(lhs_in, lhs_wgrad_how)
+
+  residuals = (
+      lhs_in, rhs_in, lhs, rhs, lhs_calibration, rhs_calibration, lhs_wgrad
+  )
   return dot_general.dot_general(lhs, rhs, dimension_numbers), residuals
 
 
@@ -181,11 +251,14 @@ def dot_general_qt_bwd(
         qarray.MaybeQArray,
         dict[str, jax.Array] | None,
         dict[str, jax.Array] | None,
+        qarray.MaybeQArray | None,
     ],
     g: jax.Array,
 ):
   """Backward pass for dot_general_qt custom VJP."""
-  lhs_in, rhs_in, lhs, rhs, lhs_calibration, rhs_calibration = residuals
+  lhs_in, rhs_in, lhs, rhs, lhs_calibration, rhs_calibration, lhs_wgrad = (
+      residuals
+  )
 
   def _compute_gradient_for_operand(g: jax.Array, *, for_dlhs: bool):
     """Compute dot_general for gradient and other_fwd_operand."""
@@ -208,7 +281,11 @@ def dot_general_qt_bwd(
       g_calibration_method = config.drhs_grad_calibration_method
       g_noise_fn = config.drhs_stochastic_rounding_noise_fn
       g_disable_channelwise_axes = config.drhs_grad_disable_channelwise_axes
-      y = lhs_in if config.use_original_residuals else lhs
+      # Prefer wgrad-layout residual when available (dual residuals).
+      if lhs_wgrad is not None:
+        y = lhs_wgrad
+      else:
+        y = lhs_in if config.use_original_residuals else lhs
       y_qtype = config.drhs_residual_qtype
       y_calibration_method = config.drhs_residual_calibration_method
       y_disable_channelwise_axes = config.drhs_residual_disable_channelwise_axes
@@ -325,6 +402,7 @@ def dot_general_qt(
         qtype=config.rhs_qtype,
         tile_size=config.tile_size,
         calibration_method=config.rhs_calibration_method,
+        non_contraction_tile_size=config.rhs_non_contraction_tile_size,
     )
     if config.rhs_disable_channelwise_axes:
       rhs_how = dataclasses.replace(rhs_how, channelwise_axes=[])
