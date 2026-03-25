@@ -62,7 +62,7 @@ def get_how_to_quantize(
   if tile_size:
     tiled_axes[contracting_axes[0]] = tile_size
 
-  if non_contraction_tile_size:
+  if non_contraction_tile_size and not for_lhs:
     channelwise_axes = []
     for axis in non_contracting:
       tiled_axes[axis] = non_contraction_tile_size

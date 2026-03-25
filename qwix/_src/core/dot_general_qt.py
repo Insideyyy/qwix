@@ -291,8 +291,10 @@ def dot_general_qt_bwd(
       y_disable_channelwise_axes = config.drhs_residual_disable_channelwise_axes
 
     if g_qtype and numerics.should_quantize(g.dtype):
-      if isinstance(y, qarray.QArray) and not any(
-          v > 1 for v in qarray.get_tiled_axes(y).values()
+      if (
+          isinstance(y, qarray.QArray)
+          and not any(v > 1 for v in qarray.get_tiled_axes(y).values())
+          and y is not lhs_wgrad
       ):
         # Apply the scale of y to g, this trick avoids requantizing y because
         # the y from fwd pass has different channelwise_axes.
@@ -309,6 +311,13 @@ def dot_general_qt_bwd(
           calibration_method=g_calibration_method,
           noise_fn=g_noise_fn,
       )
+      # Adapt tile sizes for axes whose dim < tile_size (e.g. small batch).
+      adapted = {
+          a: 1.0 if isinstance(ts, int) and g.shape[a] < ts else ts
+          for a, ts in g_how.tiled_axes.items()
+      }
+      if adapted != g_how.tiled_axes:
+        g_how = dataclasses.replace(g_how, tiled_axes=adapted)
       if g_disable_channelwise_axes:
         g_how = dataclasses.replace(g_how, channelwise_axes=[])
 

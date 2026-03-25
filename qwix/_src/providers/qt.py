@@ -358,9 +358,14 @@ class QtProvider(qconfig.QuantizationProvider):
     bwd_stochastic_rounding_noise_fn = None
 
     if rule.bwd_qtype is not None:
-      if lhs_is_weight:
+      # Default: all backward gradients use forward tile_size for subchannel.
+      # This gives 1×128 on dY in both Dgrad and Wgrad (DeepSeek V3 style).
+      dlhs_tile_size = rule.tile_size
+      drhs_tile_size = rule.tile_size
+      # Override for weight gradient direction with bwd_weight_grad_tile_size.
+      if lhs_is_weight and rule.bwd_weight_grad_tile_size is not None:
         dlhs_tile_size = rule.bwd_weight_grad_tile_size
-      if rhs_is_weight:
+      if rhs_is_weight and rule.bwd_weight_grad_tile_size is not None:
         drhs_tile_size = rule.bwd_weight_grad_tile_size
       if rule.bwd_stochastic_rounding is not None:
         bwd_stochastic_rounding_noise_fn = stochastic_rounding.get_noise_fn(
