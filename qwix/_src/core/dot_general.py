@@ -465,14 +465,40 @@ def dot_general(
           break
 
   if use_fast_dot_general:
-    return _fast_dot_general(
-        lhs,
-        rhs,
-        dimension_numbers,
-        precision=precision,
-        preferred_element_type=preferred_element_type,
-        **kwargs,
-    )
+    # Detect blockwise: operand has tiled non-contraction axes, which causes
+    # _fast_dot_general to create a large inflated intermediate (e.g. 32×).
+    # In that case, loop_dot_general iterates tiles with a Python for-loop
+    # (unrolled at trace time) to avoid the intermediate inflation.
+    # Exclude channelwise axes (tile_size=1) which don't cause inflation.
+    has_non_contraction_tiling = False
+    for operand, ca in zip((lhs, rhs), dimension_numbers[0]):
+      if isinstance(operand, qarray.QArray):
+        tiled_axes = qarray.get_tiled_axes(operand)
+        if any(
+            axis not in ca and ts > 1
+            for axis, ts in tiled_axes.items()
+        ):
+          has_non_contraction_tiling = True
+          break
+
+    if has_non_contraction_tiling:
+      return loop_dot_general(
+          lhs,
+          rhs,
+          dimension_numbers,
+          precision=precision,
+          preferred_element_type=preferred_element_type,
+          **kwargs,
+      )
+    else:
+      return _fast_dot_general(
+          lhs,
+          rhs,
+          dimension_numbers,
+          precision=precision,
+          preferred_element_type=preferred_element_type,
+          **kwargs,
+      )
   else:
     return _slow_dot_general(
         lhs,
