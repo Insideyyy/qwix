@@ -320,6 +320,10 @@ def get_scale_shape(array_shape: ShapeT, how: HowToQuantize) -> ShapeT:
       tile_size = how.tiled_axes[axis]
       if isinstance(tile_size, float):
         tile_size = round(dim * tile_size)
+      # Clamp tile_size to dim when the axis is smaller than tile_size,
+      # falling back to per-tensor scale for that axis.
+      if tile_size > dim:
+        tile_size = dim
       if tile_size <= 0 or dim % tile_size != 0:
         raise ValueError(f'{array_shape} cannot be tiled as {how.tiled_axes}.')
       scale_shape.append(dim // tile_size)
@@ -376,6 +380,9 @@ def split_axis(
       tile_size = tiled_axes[axis]
       if isinstance(tile_size, float):
         tile_size = round(dim * tile_size)
+      # Clamp tile_size to dim when the axis is smaller than tile_size.
+      if tile_size > dim:
+        tile_size = dim
       if dim % tile_size != 0:
         raise ValueError(f'{array.shape} cannot be tiled as {tiled_axes}.')
       new_shape.append(dim // tile_size)
