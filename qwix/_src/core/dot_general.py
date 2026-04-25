@@ -56,7 +56,12 @@ def get_how_to_quantize(
   channelwise_axes = sorted(set(range(ndim)) - set(contracting_axes))
   tiled_axes = {}
   if tile_size:
-    tiled_axes = {contracting_axes[0]: tile_size}
+    tiled_axis = contracting_axes[-1]
+    tiled_axes = {tiled_axis: tile_size}
+    # When there are multiple contraction axes, non-tiled contraction axes
+    # become channelwise (e.g. wgrad: contraction on (B, S) → S is tiled
+    # subchannel, B becomes channelwise).
+    channelwise_axes = sorted(set(channelwise_axes) | (set(contracting_axes) - {tiled_axis}))
 
   return qarray.HowToQuantize(
       channelwise_axes=channelwise_axes,
