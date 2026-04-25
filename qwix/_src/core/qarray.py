@@ -15,6 +15,7 @@
 
 import dataclasses
 import functools
+import logging
 from typing import Callable, Collection, Mapping, Sequence, TypeAlias
 from flax import nnx
 import flax.struct
@@ -324,8 +325,15 @@ def get_scale_shape(array_shape: ShapeT, how: HowToQuantize) -> ShapeT:
       # falling back to per-tensor scale for that axis.
       if tile_size > dim:
         tile_size = dim
-      if tile_size <= 0 or dim % tile_size != 0:
+      if tile_size <= 0:
         raise ValueError(f'{array_shape} cannot be tiled as {how.tiled_axes}.')
+      if dim % tile_size != 0:
+        logging.warning(
+            'Axis %d of shape %s is not divisible by tile_size %d, '
+            'falling back to per-tensor scale for this axis.',
+            axis, array_shape, tile_size,
+        )
+        tile_size = dim
       scale_shape.append(dim // tile_size)
     else:
       scale_shape.append(1)
@@ -384,7 +392,12 @@ def split_axis(
       if tile_size > dim:
         tile_size = dim
       if dim % tile_size != 0:
-        raise ValueError(f'{array.shape} cannot be tiled as {tiled_axes}.')
+        logging.warning(
+            'Axis %d of shape %s is not divisible by tile_size %d, '
+            'falling back to per-tensor scale for this axis.',
+            axis, array.shape, tile_size,
+        )
+        tile_size = dim
       new_shape.append(dim // tile_size)
       new_shape.append(tile_size)
     else:
