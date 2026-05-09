@@ -25,6 +25,7 @@ from qwix._src.core import dot_general
 from qwix._src.core import numerics
 from qwix._src.core import qarray
 from qwix._src.core import sparsity
+from qwix._src.core import stochastic_rounding
 
 
 @dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
@@ -46,14 +47,14 @@ class DotGeneralQtConfig:
   dlhs_grad_qtype: jax.typing.DTypeLike | None = None  # incoming gradient
   dlhs_grad_calibration_method: str = 'absmax'
   dlhs_tile_size: int | float | None = None
-  dlhs_stochastic_rounding_noise_fn: numerics.NoiseFn | None = None
+  bwd_stochastic_rounding_method: str | None = None
+  bwd_stochastic_rounding_channelwise_noise_axes: tuple[int, ...] = (0,)
   dlhs_grad_disable_channelwise_axes: bool = False
 
   # Backward pass (drhs).
   drhs_grad_qtype: jax.typing.DTypeLike | None = None  # incoming gradient
   drhs_grad_calibration_method: str = 'absmax'
   drhs_tile_size: int | float | None = None
-  drhs_stochastic_rounding_noise_fn: numerics.NoiseFn | None = None
   drhs_grad_disable_channelwise_axes: bool = False
 
   # Whether not to clip the gradients to the calibration ranges of the quantized
@@ -178,6 +179,7 @@ def dot_general_qt_fwd(
     rhs: jax.Array,
     lhs_calibration: dict[str, jax.Array] | None,
     rhs_calibration: dict[str, jax.Array] | None,
+    rng_key: jax.Array,
     dimension_numbers: jax.lax.DotDimensionNumbers,
     config: DotGeneralQtConfig,
 ):
@@ -197,7 +199,7 @@ def dot_general_qt_fwd(
     rhs = qarray.quantize_with_scale_zero_point(
         rhs, config.rhs_qtype, scale, zero_point
     )
-  residuals = (lhs_in, rhs_in, lhs, rhs, lhs_calibration, rhs_calibration)
+  residuals = (lhs_in, rhs_in, lhs, rhs, lhs_calibration, rhs_calibration, rng_key)
   return dot_general.dot_general(lhs, rhs, dimension_numbers), residuals
 
 
@@ -211,11 +213,20 @@ def dot_general_qt_bwd(
         qarray.MaybeQArray,
         dict[str, jax.Array] | None,
         dict[str, jax.Array] | None,
+        jax.Array,
     ],
     g: jax.Array,
 ):
   """Backward pass for dot_general_qt custom VJP."""
-  lhs_in, rhs_in, lhs, rhs, lhs_calibration, rhs_calibration = residuals
+  lhs_in, rhs_in, lhs, rhs, lhs_calibration, rhs_calibration, rng_key = residuals
+
+  g_noise_fn = None
+  if config.bwd_stochastic_rounding_method is not None:
+    g_noise_fn = stochastic_rounding.get_noise_fn(
+        method=config.bwd_stochastic_rounding_method,
+        key=rng_key,
+        channelwise_noise_axes=config.bwd_stochastic_rounding_channelwise_noise_axes,
+    )
 
   def _compute_gradient_for_operand(g: jax.Array, *, for_dlhs: bool):
     """Compute dot_general for gradient and other_fwd_operand."""
@@ -226,7 +237,6 @@ def dot_general_qt_bwd(
       g_qtype = config.dlhs_grad_qtype
       g_tile_size = config.dlhs_tile_size
       g_calibration_method = config.dlhs_grad_calibration_method
-      g_noise_fn = config.dlhs_stochastic_rounding_noise_fn
       g_disable_channelwise_axes = config.dlhs_grad_disable_channelwise_axes
       y = _get_residual_for_backward(config, rhs_in, rhs)
       y_qtype = config.dlhs_residual_qtype
@@ -236,7 +246,6 @@ def dot_general_qt_bwd(
       g_qtype = config.drhs_grad_qtype
       g_tile_size = config.drhs_tile_size
       g_calibration_method = config.drhs_grad_calibration_method
-      g_noise_fn = config.drhs_stochastic_rounding_noise_fn
       g_disable_channelwise_axes = config.drhs_grad_disable_channelwise_axes
       y = _get_residual_for_backward(config, lhs_in, lhs)
       y_qtype = config.drhs_residual_qtype
@@ -299,21 +308,22 @@ def dot_general_qt_bwd(
           drhs, rhs_in, rhs_calibration, config.rhs_calibration_method
       )
 
-  return dlhs, drhs, None, None
+  return dlhs, drhs, None, None, None
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(4, 5))
+@functools.partial(jax.custom_vjp, nondiff_argnums=(5, 6))
 def dot_general_qt_fwd_bwd(
     lhs: jax.Array,
     rhs: jax.Array,
     lhs_calibration: dict[str, jax.Array] | None,
     rhs_calibration: dict[str, jax.Array] | None,
+    rng_key: jax.Array,
     dimension_numbers: jax.lax.DotDimensionNumbers,
     config: DotGeneralQtConfig,
 ) -> jax.Array:
   """dot_general custom VJP."""
   result, _ = dot_general_qt_fwd(
-      lhs, rhs, lhs_calibration, rhs_calibration, dimension_numbers, config
+      lhs, rhs, lhs_calibration, rhs_calibration, rng_key, dimension_numbers, config
   )
   return result
 
@@ -326,8 +336,11 @@ def dot_general_qt(
     rhs: jax.Array,
     dimension_numbers: jax.lax.DotDimensionNumbers,
     config: DotGeneralQtConfig,
+    rng_key: jax.Array | None = None,
 ) -> jax.Array:
   """Quantized dot_general with backpropagation support."""
+  if rng_key is None:
+    rng_key = jax.random.key(0)
   lhs_calibration = None
   rhs_calibration = None
 
@@ -365,5 +378,5 @@ def dot_general_qt(
     if config.rhs_collect_quant_stat:
       rhs_calibration = config.rhs_collect_quant_stat(rhs_calibration)
   return dot_general_qt_fwd_bwd(
-      lhs, rhs, lhs_calibration, rhs_calibration, dimension_numbers, config
+      lhs, rhs, lhs_calibration, rhs_calibration, rng_key, dimension_numbers, config
   )

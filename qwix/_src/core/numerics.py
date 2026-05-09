@@ -180,9 +180,12 @@ def convert_to(
     # the range to avoid inf or nan (e.g. for e4m3fn).
     qmin, qmax = finfo.min.astype(x.dtype), finfo.max.astype(x.dtype)
     x_clipped = x.clip(qmin, qmax)
-    # Apply stochastic rounding for FP8 if noise_fn is provided
+    # Stochastic rounding: scale noise by ulp since FP8 values are non-uniform.
     if noise_fn is not None:
-      x_clipped = x_clipped.astype(jnp.float32) + noise_fn(x.shape)
+      _, exp = jnp.frexp(x_clipped)
+      exp = jnp.maximum(exp, finfo.minexp + 1)
+      ulp = 2.0 ** (exp.astype(jnp.float32) - 1 - finfo.nmant)
+      x_clipped = x_clipped.astype(jnp.float32) + noise_fn(x.shape) * ulp
     return x_clipped.astype(qtype)
 
   # dtype is an integer type. We need to round manually but clipping can be

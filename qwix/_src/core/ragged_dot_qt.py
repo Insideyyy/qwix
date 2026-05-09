@@ -20,6 +20,7 @@ import jax
 from qwix._src import interception
 from qwix._src.core import qarray
 from qwix._src.core import ragged_dot
+from qwix._src.core import stochastic_rounding
 
 
 @dataclasses.dataclass(slots=True, frozen=True, kw_only=True)
@@ -33,6 +34,8 @@ class RaggedDotQtConfig:
   # Backward pass settings
   dlhs_grad_qtype: jax.typing.DTypeLike | None = None
   drhs_grad_qtype: jax.typing.DTypeLike | None = None
+  bwd_stochastic_rounding_method: str | None = None
+  bwd_stochastic_rounding_channelwise_noise_axes: tuple[int, ...] = (0,)
 
 
 @interception.disable_interceptions
@@ -40,6 +43,7 @@ def ragged_dot_qt_fwd(
     lhs: jax.Array,
     rhs: jax.Array,
     group_sizes: jax.Array,
+    rng_key: jax.Array,
     config: RaggedDotQtConfig,
     precision: jax.lax.PrecisionLike = None,
     preferred_element_type: jax.typing.DTypeLike | None = None,
@@ -59,7 +63,7 @@ def ragged_dot_qt_fwd(
   primal_out = ragged_dot.ragged_dot(
       qlhs, qrhs, group_sizes, precision, preferred_element_type, group_offset
   )
-  return primal_out, (qlhs, qrhs, group_sizes)
+  return primal_out, (qlhs, qrhs, group_sizes, rng_key)
 
 
 def ragged_dot_qt_bwd(
@@ -69,11 +73,19 @@ def ragged_dot_qt_bwd(
     preferred_element_type: jax.typing.DTypeLike | None,
     group_offset: jax.Array | None,
     # Residuals from fwd pass
-    residuals: tuple[qarray.MaybeQArray, qarray.MaybeQArray, jax.Array],
+    residuals: tuple[qarray.MaybeQArray, qarray.MaybeQArray, jax.Array, jax.Array],
     g: jax.Array,
-) -> tuple[jax.Array, jax.Array, None]:
+) -> tuple[jax.Array, jax.Array, None, None]:
   """Backward pass for ragged_dot_qt custom VJP."""
-  (lhs, rhs, group_sizes) = residuals  # lhs [M, K], rhs [G, K, N], g [M, N]
+  (lhs, rhs, group_sizes, rng_key) = residuals  # lhs [M, K], rhs [G, K, N], g [M, N]
+
+  g_noise_fn = None
+  if config.bwd_stochastic_rounding_method is not None:
+    g_noise_fn = stochastic_rounding.get_noise_fn(
+        method=config.bwd_stochastic_rounding_method,
+        key=rng_key,
+        channelwise_noise_axes=config.bwd_stochastic_rounding_channelwise_noise_axes,
+    )
 
   # dlhs = ragged_dot(g, rhs.swapaxes(1, 2))
   # [M, K] = [M, N] @ [G, N, K]
@@ -89,6 +101,7 @@ def ragged_dot_qt_bwd(
     g_how = qarray.HowToQuantize(
         qtype=config.dlhs_grad_qtype,
         channelwise_axes=[0],  # [M, N]
+        noise_fn=g_noise_fn,
     )
     g_for_dlhs = qarray.quantize(g_for_dlhs, g_how)
   dlhs = ragged_dot.ragged_dot(
@@ -116,6 +129,7 @@ def ragged_dot_qt_bwd(
     g_how = qarray.HowToQuantize(
         qtype=config.drhs_grad_qtype,
         channelwise_axes=[1],  # [M, N]
+        noise_fn=g_noise_fn,
     )
     g_for_drhs = qarray.quantize(g_for_drhs, g_how)
   drhs = ragged_dot.ragged_dot_general(
@@ -128,14 +142,15 @@ def ragged_dot_qt_bwd(
       group_offset=group_offset,
   )
 
-  return dlhs, drhs, None
+  return dlhs, drhs, None, None
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5, 6))
+@functools.partial(jax.custom_vjp, nondiff_argnums=(4, 5, 6, 7))
 def ragged_dot_qt(
     lhs: jax.Array,
     rhs: jax.Array,
     group_sizes: jax.Array,
+    rng_key: jax.Array,
     config: RaggedDotQtConfig,
     precision: jax.lax.PrecisionLike = None,
     preferred_element_type: jax.typing.DTypeLike | None = None,
@@ -146,6 +161,7 @@ def ragged_dot_qt(
       lhs,
       rhs,
       group_sizes,
+      rng_key,
       config,
       precision,
       preferred_element_type,
