@@ -222,10 +222,12 @@ def dot_general_qt_bwd(
 
   g_noise_fn = None
   if config.bwd_stochastic_rounding_method is not None:
+    # Use elementwise noise: channelwise sharing along the contraction axis
+    # causes O(K) coherent error amplification in the dot product.
     g_noise_fn = stochastic_rounding.get_noise_fn(
         method=config.bwd_stochastic_rounding_method,
         key=rng_key,
-        channelwise_noise_axes=config.bwd_stochastic_rounding_channelwise_noise_axes,
+        channelwise_noise_axes=None,
     )
 
   def _compute_gradient_for_operand(g: jax.Array, *, for_dlhs: bool):

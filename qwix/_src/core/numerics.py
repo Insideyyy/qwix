@@ -183,6 +183,8 @@ def convert_to(
     # Stochastic rounding: scale noise by ulp since FP8 values are non-uniform.
     if noise_fn is not None:
       _, exp = jnp.frexp(x_clipped)
+      # Clamp to min normal exponent (frexp convention). frexp(0)=(0,0)
+      # so we need this to avoid undersized ulp at zero/subnormals.
       exp = jnp.maximum(exp, finfo.minexp + 1)
       ulp = 2.0 ** (exp.astype(jnp.float32) - 1 - finfo.nmant)
       x_clipped = x_clipped.astype(jnp.float32) + noise_fn(x.shape) * ulp

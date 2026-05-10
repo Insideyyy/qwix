@@ -84,7 +84,7 @@ def ragged_dot_qt_bwd(
     g_noise_fn = stochastic_rounding.get_noise_fn(
         method=config.bwd_stochastic_rounding_method,
         key=rng_key,
-        channelwise_noise_axes=config.bwd_stochastic_rounding_channelwise_noise_axes,
+        channelwise_noise_axes=None,
     )
 
   # dlhs = ragged_dot(g, rhs.swapaxes(1, 2))

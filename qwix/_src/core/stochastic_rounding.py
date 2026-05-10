@@ -74,7 +74,7 @@ def uniform_noise(
 def get_noise_fn(
     method: str,
     key: jax.Array,
-    channelwise_noise_axes: Sequence[int] = (0,),
+    channelwise_noise_axes: Sequence[int] | None = (0,),
 ) -> Callable[[tuple[int, ...]], jax.Array]:
   """Returns a noise function for stochastic rounding."""
   if method == 'uniform':
@@ -85,6 +85,9 @@ def get_noise_fn(
     raise ValueError(f'Unsupported stochastic rounding method: {method}')
 
   def noise_fn(shape: tuple[int, ...]) -> jax.Array:
+    # When channelwise_noise_axes is None, generate elementwise noise.
+    if channelwise_noise_axes is None:
+      return fn(key, shape)
     # Apply channelwise_noise_axes to get the noise shape. This significantly
     # reduces the overhead of creating a full noise array.
     noise_shape = tuple(
