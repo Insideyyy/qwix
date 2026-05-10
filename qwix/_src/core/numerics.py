@@ -186,6 +186,11 @@ def convert_to(
       exp = jnp.maximum(exp, finfo.minexp + 1)
       ulp = 2.0 ** (exp.astype(jnp.float32) - 1 - finfo.nmant)
       x_clipped = x_clipped.astype(jnp.float32) + noise_fn(x.shape) * ulp
+      # Re-clip: noise can push values beyond the representable range,
+      # producing inf (e.g. e5m2 has inf, so values > qmax become inf).
+      x_clipped = x_clipped.clip(
+          finfo.min.astype(jnp.float32), finfo.max.astype(jnp.float32)
+      )
     return x_clipped.astype(qtype)
 
   # dtype is an integer type. We need to round manually but clipping can be
