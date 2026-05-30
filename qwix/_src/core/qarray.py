@@ -641,6 +641,7 @@ def quantize_api(
     tiled_axes: Mapping[int, int | float] | None = None,
     calibration_method: str = 'absmax',
     scale_dtype: jax.typing.DTypeLike | None = None,
+    noise_fn: numerics.NoiseFn | None = None,
 ) -> QArray:
   """Quantize a Jax Array into QArray using a dynamic range.
 
@@ -661,6 +662,8 @@ def quantize_api(
     scale_dtype: The dtype of the scale. If not given, the dtype will be the
       same as the array's dtype. Note that the scale's dtype decides the
       dequantized array's dtype.
+    noise_fn: Optional stochastic-rounding noise function. Called as
+      `noise_fn(qvalue.shape)` and added to the scaled value before truncation.
 
   Returns:
     The quantized array.
@@ -671,6 +674,7 @@ def quantize_api(
       channelwise_axes=channelwise_axes,
       tiled_axes=tiled_axes or {},
       calibration_method=calibration_method,
+      noise_fn=noise_fn,
   )
   array = quantize(array, how)
   if scale_dtype is not None:
