@@ -52,17 +52,8 @@ class QtTest(absltest.TestCase):
         {}, lhs, rhs, rngs=rngs, method=TestModule.test_config
     )
 
-    self.assertIsNotNone(config_reuse.dlhs_stochastic_rounding_noise_fn)
-    self.assertIsNotNone(config_reuse.drhs_stochastic_rounding_noise_fn)
-    self.assertIs(
-        config_reuse.dlhs_stochastic_rounding_noise_fn,
-        config_reuse.drhs_stochastic_rounding_noise_fn,
-    )
-
-    shape = (8, 32)
-    noise_lhs_reuse = config_reuse.dlhs_stochastic_rounding_noise_fn(shape)
-    noise_rhs_reuse = config_reuse.drhs_stochastic_rounding_noise_fn(shape)
-    self.assertTrue(jnp.array_equal(noise_lhs_reuse, noise_rhs_reuse))
+    self.assertEqual(config_reuse.bwd_stochastic_rounding_method, "low_bit_uniform")
+    self.assertEqual(config_reuse.bwd_stochastic_rounding_channelwise_noise_axes, (0,))
 
   def test_srq_jit_grad(self):
     """Test that the grad of SRQ can be taken inside a jitted function."""

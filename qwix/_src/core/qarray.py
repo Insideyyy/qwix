@@ -15,6 +15,7 @@
 
 import dataclasses
 import functools
+import logging
 from typing import Callable, Collection, Mapping, Sequence, TypeAlias
 from flax import nnx
 import flax.struct
@@ -320,8 +321,19 @@ def get_scale_shape(array_shape: ShapeT, how: HowToQuantize) -> ShapeT:
       tile_size = how.tiled_axes[axis]
       if isinstance(tile_size, float):
         tile_size = round(dim * tile_size)
-      if tile_size <= 0 or dim % tile_size != 0:
+      # Clamp tile_size to dim when the axis is smaller than tile_size,
+      # falling back to per-tensor scale for that axis.
+      if tile_size > dim:
+        tile_size = dim
+      if tile_size <= 0:
         raise ValueError(f'{array_shape} cannot be tiled as {how.tiled_axes}.')
+      if dim % tile_size != 0:
+        logging.warning(
+            'Axis %d of shape %s is not divisible by tile_size %d, '
+            'falling back to per-tensor scale for this axis.',
+            axis, array_shape, tile_size,
+        )
+        tile_size = dim
       scale_shape.append(dim // tile_size)
     else:
       scale_shape.append(1)
@@ -376,8 +388,16 @@ def split_axis(
       tile_size = tiled_axes[axis]
       if isinstance(tile_size, float):
         tile_size = round(dim * tile_size)
+      # Clamp tile_size to dim when the axis is smaller than tile_size.
+      if tile_size > dim:
+        tile_size = dim
       if dim % tile_size != 0:
-        raise ValueError(f'{array.shape} cannot be tiled as {tiled_axes}.')
+        logging.warning(
+            'Axis %d of shape %s is not divisible by tile_size %d, '
+            'falling back to per-tensor scale for this axis.',
+            axis, array.shape, tile_size,
+        )
+        tile_size = dim
       new_shape.append(dim // tile_size)
       new_shape.append(tile_size)
     else:
@@ -621,6 +641,7 @@ def quantize_api(
     tiled_axes: Mapping[int, int | float] | None = None,
     calibration_method: str = 'absmax',
     scale_dtype: jax.typing.DTypeLike | None = None,
+    noise_fn: numerics.NoiseFn | None = None,
 ) -> QArray:
   """Quantize a Jax Array into QArray using a dynamic range.
 
@@ -641,6 +662,8 @@ def quantize_api(
     scale_dtype: The dtype of the scale. If not given, the dtype will be the
       same as the array's dtype. Note that the scale's dtype decides the
       dequantized array's dtype.
+    noise_fn: Optional stochastic-rounding noise function. Called as
+      `noise_fn(qvalue.shape)` and added to the scaled value before truncation.
 
   Returns:
     The quantized array.
@@ -651,6 +674,7 @@ def quantize_api(
       channelwise_axes=channelwise_axes,
       tiled_axes=tiled_axes or {},
       calibration_method=calibration_method,
+      noise_fn=noise_fn,
   )
   array = quantize(array, how)
   if scale_dtype is not None:

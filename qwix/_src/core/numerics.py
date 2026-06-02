@@ -179,7 +179,18 @@ def convert_to(
     # dtype is a floating point type. No rounding needed, but we need to clip to
     # the range to avoid inf or nan (e.g. for e4m3fn).
     qmin, qmax = finfo.min.astype(x.dtype), finfo.max.astype(x.dtype)
-    return x.clip(qmin, qmax).astype(qtype)
+    x_clipped = x.clip(qmin, qmax)
+    # Stochastic rounding for floating-point types.
+    # The "add noise then RNE" approach is INCORRECT for non-uniform FP types
+    # because noise can push values across exponent boundaries where step sizes
+    # differ, causing rounding to wrong grid points (e.g. at x=1.0 in e5m2,
+    # noise in (-0.125, 0.125) can push x below 1.0 into the [0.5,1.0) range
+    # where RNE rounds to 0.875 instead of staying at 1.0).
+    # Instead, we find the two nearest FP8 grid points and stochastically
+    # choose between them based on the distance ratio.
+    if noise_fn is not None:
+      return _fp_stochastic_round(x_clipped, qtype, noise_fn)
+    return x_clipped.astype(qtype)
 
   # dtype is an integer type. We need to round manually but clipping can be
   # handled by "astype".
@@ -189,6 +200,108 @@ def convert_to(
     # round(41-0.4) = round(40.6) = 41.
     x = x.astype(jnp.float32) + noise_fn(x.shape)
   return jnp.round(x).astype(qtype)
+
+
+def _fp_stochastic_round(
+    x: jax.Array,
+    qtype: jax.typing.DTypeLike,
+    noise_fn: NoiseFn,
+) -> jax.Array:
+  """Stochastic rounding for non-uniform floating-point types.
+
+  For FP types with non-uniform spacing (e.g. float8), the "add noise then
+  round-to-nearest" approach is incorrect because noise can push values across
+  exponent boundaries where step sizes differ, causing rounding to wrong grid
+  points. Instead, we find the two nearest representable values (floor and
+  ceil) and stochastically choose between them based on the distance ratio:
+    P(ceil) = (x - floor) / (ceil - floor)
+
+  Args:
+    x: Input array, already clipped to the qtype range.
+    qtype: The target floating-point type.
+    noise_fn: Function that generates uniform noise in (-0.5, 0.5).
+
+  Returns:
+    The stochastically rounded array in qtype.
+  """
+  # floor_fp8: largest FP8 value <= x (round toward -inf)
+  # We compute this by: round to nearest FP8, then if result > x, subtract one ULP.
+  x_rounded_fp8 = x.astype(qtype)
+  x_rounded = x_rounded_fp8.astype(jnp.float32)
+  # floor = rounded if rounded <= x, else prev FP8 value
+  floor_val = jnp.where(x_rounded <= x, x_rounded, _prev_float(x_rounded_fp8, qtype))
+  # ceil = smallest FP8 value >= x
+  ceil_val = jnp.where(x_rounded >= x, x_rounded, _next_float(x_rounded_fp8, qtype))
+
+  # When x is exactly on a grid point, floor == ceil, probability is 0 or 1.
+  gap = ceil_val - floor_val
+  # P(ceil) = (x - floor) / (ceil - floor). When gap == 0, x is exactly
+  # representable so P should be 0 (stay at floor == ceil).
+  p_ceil = jnp.where(gap > 0, (x - floor_val) / gap, 0.0)
+
+  # noise_fn returns values in (-0.5, 0.5). Map to (0, 1):
+  # (noise + 0.5) gives uniform in (0, 1).
+  noise = noise_fn(x.shape) + 0.5
+  choose_ceil = noise < p_ceil
+
+  result = jnp.where(choose_ceil, ceil_val, floor_val)
+  return result.astype(qtype)
+
+
+def _next_float(x: jax.Array, qtype: jax.typing.DTypeLike) -> jax.Array:
+  """Returns the next representable value in qtype after x (toward +inf).
+
+  x must already be a representable value in qtype (cast from qtype).
+  For IEEE 754, positive values have incrementing bit patterns, while negative
+  values have decrementing bit patterns when moving toward +inf.
+  """
+  dtype = jnp.dtype(qtype)
+  uint_map = {1: jnp.uint8, 2: jnp.uint16, 4: jnp.uint32, 8: jnp.uint64}
+  uint_type = uint_map[dtype.itemsize]
+
+  bits = jax.lax.bitcast_convert_type(x, uint_type)
+  sign_bit = jax.lax.bitcast_convert_type(
+      jnp.array(-0.0, dtype=dtype), uint_type
+  )
+  is_negative = jnp.bitwise_and(bits, sign_bit) != 0
+  # Positive: increment bit pattern. Negative: decrement (toward zero = +inf).
+  delta = jnp.where(is_negative, -1, 1)
+  next_bits = (bits.astype(jnp.int32) + delta).astype(uint_type)
+  result = jax.lax.bitcast_convert_type(next_bits, dtype).astype(jnp.float32)
+  # Clamp: if we hit inf/nan, return the appropriate finite boundary.
+  finfo = jnp.finfo(qtype)
+  return jnp.where(
+      jnp.isinf(result) | jnp.isnan(result),
+      jnp.where(is_negative, finfo.min, finfo.max).astype(jnp.float32),
+      result,
+  )
+
+
+def _prev_float(x: jax.Array, qtype: jax.typing.DTypeLike) -> jax.Array:
+  """Returns the previous representable value in qtype before x (toward -inf).
+
+  x must already be a representable value in qtype (cast from qtype).
+  """
+  dtype = jnp.dtype(qtype)
+  uint_map = {1: jnp.uint8, 2: jnp.uint16, 4: jnp.uint32, 8: jnp.uint64}
+  uint_type = uint_map[dtype.itemsize]
+
+  bits = jax.lax.bitcast_convert_type(x, uint_type)
+  sign_bit = jax.lax.bitcast_convert_type(
+      jnp.array(-0.0, dtype=dtype), uint_type
+  )
+  is_negative = jnp.bitwise_and(bits, sign_bit) != 0
+  # Positive: decrement (toward -inf). Negative: increment (toward -inf).
+  delta = jnp.where(is_negative, 1, -1)
+  prev_bits = (bits.astype(jnp.int32) + delta).astype(uint_type)
+  result = jax.lax.bitcast_convert_type(prev_bits, dtype).astype(jnp.float32)
+  # Clamp: if we hit inf/nan, return the appropriate finite boundary.
+  finfo = jnp.finfo(qtype)
+  return jnp.where(
+      jnp.isinf(result) | jnp.isnan(result),
+      jnp.where(is_negative, finfo.min, finfo.max).astype(jnp.float32),
+      result,
+  )
 
 
 def convert_from(x: jax.Array, qtype: jax.typing.DTypeLike) -> jax.Array:

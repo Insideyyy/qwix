@@ -92,8 +92,12 @@ class QtProvider(qconfig.QuantizationProvider):
           preferred_element_type=preferred_element_type,
           out_sharding=out_sharding,
       )
+    # Pass rng_key as a traced arg to custom_vjp to avoid tracer leak
+    rng_key = None
+    if rule.bwd_qtype is not None and rule.bwd_stochastic_rounding is not None:
+      rng_key = flax_util.make_rng('stochastic_rounding')
     config = self._create_dot_general_qt_config(rule, op_id, lhs, rhs)
-    return dot_general_qt.dot_general_qt(lhs, rhs, dimension_numbers, config)
+    return dot_general_qt.dot_general_qt(lhs, rhs, dimension_numbers, config, rng_key=rng_key)
 
   def einsum(
       self,
@@ -119,6 +123,11 @@ class QtProvider(qconfig.QuantizationProvider):
       # TODO(jiwonshin): Support N-ary einsum if there is a need in the future.
       raise ValueError(f'Unsupported einsum format: {einsum_str=} {operands=}')
 
+    # Pass rng_key as a traced arg to custom_vjp to avoid tracer leak
+    rng_key = None
+    if rule.bwd_qtype is not None and rule.bwd_stochastic_rounding is not None:
+      rng_key = flax_util.make_rng('stochastic_rounding')
+
     def custom_dot_general(
         lhs,
         rhs,
@@ -136,6 +145,7 @@ class QtProvider(qconfig.QuantizationProvider):
           # lhs and rhs might be flipped by einsum so we cannot use the operands
           # from the einsum call.
           self._create_dot_general_qt_config(rule, op_id, lhs, rhs),
+          rng_key=rng_key,
       )
 
     with jax.disable_jit():
@@ -217,11 +227,16 @@ class QtProvider(qconfig.QuantizationProvider):
           preferred_element_type=preferred_element_type,
           group_offset=group_offset,
       )
+    # Pass rng_key as a traced arg to custom_vjp to avoid tracer leak
+    rng_key = jax.random.key(0)
+    if rule.bwd_qtype is not None and rule.bwd_stochastic_rounding is not None:
+      rng_key = flax_util.make_rng('stochastic_rounding')
     config = self._create_ragged_dot_qt_config(rule)
     return ragged_dot_qt.ragged_dot_qt(
         lhs,
         rhs,
         group_sizes,
+        rng_key,
         config,
         precision,
         preferred_element_type,
@@ -347,19 +362,12 @@ class QtProvider(qconfig.QuantizationProvider):
     # bwd config, which is only enabled when bwd_qtype is set.
     dlhs_tile_size = None
     drhs_tile_size = None
-    bwd_stochastic_rounding_noise_fn = None
 
     if rule.bwd_qtype is not None:
       if lhs_is_weight:
         dlhs_tile_size = rule.bwd_weight_grad_tile_size
       if rhs_is_weight:
         drhs_tile_size = rule.bwd_weight_grad_tile_size
-      if rule.bwd_stochastic_rounding is not None:
-        bwd_stochastic_rounding_noise_fn = stochastic_rounding.get_noise_fn(
-            method=rule.bwd_stochastic_rounding,
-            key=flax_util.make_rng('stochastic_rounding'),
-            channelwise_noise_axes=rule.channelwise_noise_axes,
-        )
 
     fwd_quantized = rule.weight_qtype is not None or rule.act_qtype is not None
     bwd_quantized = rule.bwd_qtype is not None
@@ -379,14 +387,14 @@ class QtProvider(qconfig.QuantizationProvider):
         dlhs_grad_qtype=rule.bwd_qtype,
         dlhs_grad_calibration_method=rule.bwd_calibration_method,
         dlhs_tile_size=dlhs_tile_size,
-        dlhs_stochastic_rounding_noise_fn=bwd_stochastic_rounding_noise_fn,
+        bwd_stochastic_rounding_method=rule.bwd_stochastic_rounding,
+        bwd_stochastic_rounding_channelwise_noise_axes=rule.channelwise_noise_axes,
         dlhs_grad_disable_channelwise_axes=rule.disable_channelwise_axes,
         # drhs configs.
         use_original_residuals=fwd_quantized and not bwd_quantized,
         drhs_grad_qtype=rule.bwd_qtype,
         drhs_grad_calibration_method=rule.bwd_calibration_method,
         drhs_tile_size=drhs_tile_size,
-        drhs_stochastic_rounding_noise_fn=bwd_stochastic_rounding_noise_fn,
         drhs_grad_disable_channelwise_axes=rule.disable_channelwise_axes,
     )
 
@@ -400,6 +408,7 @@ class QtProvider(qconfig.QuantizationProvider):
   ) -> ragged_dot_qt.RaggedDotQtConfig:
     """Creates a RaggedDotQtConfig for ragged_dot."""
     assert isinstance(rule, QtRule), '_init_rule should have been called.'
+
     # Assume LHS is an activation and RHS is a weight.
     return ragged_dot_qt.RaggedDotQtConfig(
         # fwd configs.
@@ -408,4 +417,6 @@ class QtProvider(qconfig.QuantizationProvider):
         # bwd configs.
         dlhs_grad_qtype=rule.bwd_qtype,
         drhs_grad_qtype=rule.bwd_qtype,
+        bwd_stochastic_rounding_method=rule.bwd_stochastic_rounding,
+        bwd_stochastic_rounding_channelwise_noise_axes=rule.channelwise_noise_axes,
     )

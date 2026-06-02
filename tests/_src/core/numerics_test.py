@@ -98,6 +98,68 @@ class NumericsTest(absltest.TestCase):
     # round-half-to-even.
     self.assertAlmostEqual(jnp.mean(y), -0.5, delta=0.1)
 
+  def test_fp8_stochastic_rounding_exact_grid_point(self):
+    # x=1.0 is an exact e5m2 grid point. SR should always stay at 1.0.
+    key = jax.random.PRNGKey(0)
+    noise_fn = functools.partial(stochastic_rounding.uniform_noise, key)
+    x = jnp.array([1.0])
+    result = numerics.convert_to(x, jnp.float8_e5m2, noise_fn=noise_fn)
+    self._assert_equal(result.astype(jnp.float32), jnp.array([1.0]))
+
+  def test_fp8_stochastic_rounding_midpoint(self):
+    # x=1.125 is the midpoint between e5m2 values 1.0 and 1.25.
+    # P(ceil=1.25) should be ~0.5.
+    key = jax.random.PRNGKey(0)
+    noise_fn = functools.partial(stochastic_rounding.uniform_noise, key)
+    x = jnp.full((10000,), 1.125)
+    result = numerics.convert_to(x, jnp.float8_e5m2, noise_fn=noise_fn)
+    p_ceil = jnp.mean(result.astype(jnp.float32) > 1.1)
+    self.assertAlmostEqual(float(p_ceil), 0.5, delta=0.1)
+
+  def test_fp8_stochastic_rounding_near_grid_point(self):
+    # x=1.01 is close to 1.0, next e5m2 value is 1.25.
+    # P(ceil=1.25) = (1.01 - 1.0) / (1.25 - 1.0) = 0.04.
+    key = jax.random.PRNGKey(0)
+    noise_fn = functools.partial(stochastic_rounding.uniform_noise, key)
+    x = jnp.full((10000,), 1.01)
+    result = numerics.convert_to(x, jnp.float8_e5m2, noise_fn=noise_fn)
+    p_ceil = jnp.mean(result.astype(jnp.float32) > 1.1)
+    self.assertAlmostEqual(float(p_ceil), 0.04, delta=0.05)
+
+  def test_fp8_stochastic_rounding_e4m3fn(self):
+    # x=1.0 is an exact e4m3fn grid point. SR should always stay at 1.0.
+    key = jax.random.PRNGKey(0)
+    noise_fn = functools.partial(stochastic_rounding.uniform_noise, key)
+    x = jnp.array([1.0])
+    result = numerics.convert_to(x, jnp.float8_e4m3fn, noise_fn=noise_fn)
+    self._assert_equal(result.astype(jnp.float32), jnp.array([1.0]))
+
+  def test_next_prev_float(self):
+    # e5m2: 1.0 -> next=1.25, prev=0.875
+    v = jnp.array([1.0]).astype(jnp.float8_e5m2)
+    self._assert_equal(
+        numerics._next_float(v, jnp.float8_e5m2), jnp.array([1.25])
+    )
+    self._assert_equal(
+        numerics._prev_float(v, jnp.float8_e5m2), jnp.array([0.875])
+    )
+    # e4m3fn: 1.0 -> next=1.125, prev=0.9375
+    v = jnp.array([1.0]).astype(jnp.float8_e4m3fn)
+    self._assert_equal(
+        numerics._next_float(v, jnp.float8_e4m3fn), jnp.array([1.125])
+    )
+    self._assert_equal(
+        numerics._prev_float(v, jnp.float8_e4m3fn), jnp.array([0.9375])
+    )
+    # Negative: -1.0 -> next=-0.875, prev=-1.25
+    v = jnp.array([-1.0]).astype(jnp.float8_e5m2)
+    self._assert_equal(
+        numerics._next_float(v, jnp.float8_e5m2), jnp.array([-0.875])
+    )
+    self._assert_equal(
+        numerics._prev_float(v, jnp.float8_e5m2), jnp.array([-1.25])
+    )
+
   def test_nf4(self):
     self._assert_equal(
         numerics.convert_to(jnp.array([-1.0, -0.5, 0.0, 0.8, 1.0]), "nf4"),
